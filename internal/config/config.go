@@ -35,8 +35,8 @@ type EnvConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Model: ModelConfig{
-			Name:      "claude-sonnet-4-20250514",
-			Provider:  "anthropic",
+			Name:      "gpt-5.4-mini",
+			Provider:  "openai",
 			MaxTokens: 4096,
 		},
 		Agent: AgentConfig{
