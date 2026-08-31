@@ -20,6 +20,7 @@ func (AgentStart) agentEvent() {}
 
 type AgentEnd struct {
 	Messages []message.AgentMessage
+	Err      error
 }
 
 func (AgentEnd) agentEvent() {}

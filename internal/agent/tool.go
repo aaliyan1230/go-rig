@@ -8,9 +8,11 @@ import (
 	"github.com/aaliyan1230/go-rig/internal/provider"
 )
 
-// Tool is a sealed interface for executable tools available to the agent.
+// Tool is an executable capability available to the agent.
+//
+// Tool is deliberately open: concrete tools live in the tools package and can
+// be added without teaching the agent loop about their implementation.
 type Tool interface {
-	tool()
 	ToolName() string
 	ToolDescription() string
 	ToolSchema() json.RawMessage

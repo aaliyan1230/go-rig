@@ -16,10 +16,9 @@ type fakeTool struct {
 	schema      json.RawMessage
 }
 
-func (f fakeTool) tool()                        {}
-func (f fakeTool) ToolName() string             { return f.name }
-func (f fakeTool) ToolDescription() string      { return f.description }
-func (f fakeTool) ToolSchema() json.RawMessage  { return f.schema }
+func (f fakeTool) ToolName() string            { return f.name }
+func (f fakeTool) ToolDescription() string     { return f.description }
+func (f fakeTool) ToolSchema() json.RawMessage { return f.schema }
 func (f fakeTool) Execute(_ context.Context, _ string, _ json.RawMessage) (ToolResult, error) {
 	return ToolResult{Content: []message.ContentBlock{message.TextContent{Text: "ok"}}}, nil
 }
