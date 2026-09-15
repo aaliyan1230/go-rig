@@ -40,16 +40,14 @@ func DefaultConfig() Config {
 			MaxTokens: 4096,
 		},
 		Agent: AgentConfig{
-			MaxTurns: 10,
-			SystemPrompt: `You are a coding assistant. You help with software engineering tasks.
-Use the available tools to read, write, and edit files.
-Be concise. Think before you act.`,
+			MaxTurns:     10,
+			SystemPrompt: "You are a coding assistant. You help with software engineering tasks.\nUse the available tools to read, write, edit, and run bash commands.\nBe concise. Think before you act.",
 		},
 		Tools: ToolConfig{
 			Read:  true,
-			Write: false,
-			Edit:  false,
-			Bash:  false,
+			Write: true,
+			Edit:  true,
+			Bash:  true,
 		},
 		Env: EnvConfig{
 			ShellPath: "/bin/bash",

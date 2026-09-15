@@ -29,6 +29,77 @@ func TestReadToolReadsRelativeUTF8File(t *testing.T) {
 	}
 }
 
+func TestReadToolSupportsOffsetAndLimit(t *testing.T) {
+	dir := t.TempDir()
+	content := "one\ntwo\nthree\nfour\nfive\n"
+	if err := os.WriteFile(filepath.Join(dir, "lines.txt"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadTool(env.NewLocalEnv(dir))
+	result, err := tool.Execute(context.Background(), "call-1", json.RawMessage(`{"path":"lines.txt","offset":2,"limit":2}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := toolResultText(t, result.Content)
+	if !strings.Contains(got, "two\nthree\n") {
+		t.Fatalf("page content = %q, want lines two and three", got)
+	}
+	if !strings.Contains(got, "Use offset=4 to continue") {
+		t.Fatalf("page is missing continuation hint: %q", got)
+	}
+}
+
+func TestReadToolRejectsInvalidPagingArguments(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lines.txt"), []byte("one\ntwo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(env.NewLocalEnv(dir))
+	for _, input := range []string{
+		`{"path":"lines.txt","offset":0}`,
+		`{"path":"lines.txt","offset":-1}`,
+		`{"path":"lines.txt","limit":0}`,
+		`{"path":"lines.txt","limit":-2}`,
+		`{"path":"lines.txt","offset":1.5}`,
+		`{"path":"lines.txt","limit":null}`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			_, err := tool.Execute(context.Background(), "call-1", json.RawMessage(input))
+			if err == nil {
+				t.Fatalf("expected an error for %s", input)
+			}
+		})
+	}
+}
+
+func TestReadToolRejectsOffsetBeyondEnd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lines.txt"), []byte("one\ntwo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(env.NewLocalEnv(dir))
+	_, err := tool.Execute(context.Background(), "call-1", json.RawMessage(`{"path":"lines.txt","offset":3}`))
+	if err == nil || !strings.Contains(err.Error(), "offset 3 is beyond end of file") {
+		t.Fatalf("error = %v, want a clear out-of-range error", err)
+	}
+}
+
+func TestReadToolAllowsOffsetOneForEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "empty.txt"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(env.NewLocalEnv(dir))
+	result, err := tool.Execute(context.Background(), "call-1", json.RawMessage(`{"path":"empty.txt","offset":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toolResultText(t, result.Content); got != "" {
+		t.Fatalf("empty file result = %q, want empty string", got)
+	}
+}
+
 func TestReadToolRejectsInvalidArguments(t *testing.T) {
 	tool := NewReadTool(env.NewLocalEnv(t.TempDir()))
 	for _, input := range []string{

@@ -181,6 +181,26 @@ func TestLocalEnv_Exec(t *testing.T) {
 	}
 }
 
+func TestLocalEnv_CustomShellPath(t *testing.T) {
+	env := NewLocalEnvWithShell(t.TempDir(), "/bin/sh")
+	result, err := env.Exec(context.Background(), "printf custom-shell", ExecOptions{})
+	if err != nil {
+		t.Fatalf("Exec with custom shell: %v", err)
+	}
+	if result.Stdout != "custom-shell" {
+		t.Fatalf("Stdout = %q, want custom-shell", result.Stdout)
+	}
+}
+
+func TestLocalEnv_ExecHonorsCanceledContext(t *testing.T) {
+	env := NewLocalEnv(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := env.Exec(ctx, "sleep 1", ExecOptions{}); err == nil {
+		t.Fatal("Exec with canceled context unexpectedly succeeded")
+	}
+}
+
 func TestLocalEnv_ExecStderr(t *testing.T) {
 	env := NewLocalEnv(t.TempDir())
 

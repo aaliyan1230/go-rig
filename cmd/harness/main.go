@@ -80,11 +80,8 @@ func runWithOptions(cfg config.Config, prompt, apiKeyFlag, baseURL string, conti
 		return 1
 	}
 	workingDir = filepath.Clean(workingDir)
-	localEnv := env.NewLocalEnv(workingDir)
-	tools := make([]agent.Tool, 0, 1)
-	if cfg.Tools.Read {
-		tools = append(tools, builtintools.NewReadTool(localEnv))
-	}
+	localEnv := env.NewLocalEnvWithShell(workingDir, cfg.Env.ShellPath)
+	tools := configuredTools(cfg.Tools, localEnv)
 
 	if sessionDir == "" {
 		sessionDir, err = os.UserConfigDir()
@@ -109,6 +106,23 @@ func runWithOptions(cfg config.Config, prompt, apiKeyFlag, baseURL string, conti
 	}
 
 	return streamPromptWithSession(client, cfg, prompt, tools, activeSession, stdout, stderr)
+}
+
+func configuredTools(cfg config.ToolConfig, environment env.Env) []agent.Tool {
+	tools := make([]agent.Tool, 0, 4)
+	if cfg.Read {
+		tools = append(tools, builtintools.NewReadTool(environment))
+	}
+	if cfg.Write {
+		tools = append(tools, builtintools.NewWriteTool(environment))
+	}
+	if cfg.Edit {
+		tools = append(tools, builtintools.NewEditTool(environment))
+	}
+	if cfg.Bash {
+		tools = append(tools, builtintools.NewBashTool(environment))
+	}
+	return tools
 }
 
 // sessionSink is the small persistence surface consumed by the CLI. Keeping

@@ -294,6 +294,87 @@ func TestStreamPromptAppendFailureWarnsAndKeepsOutput(t *testing.T) {
 	}
 }
 
+func TestConfiguredToolsUsesAllCoreToolsInStableOrder(t *testing.T) {
+	tools := configuredTools(config.DefaultConfig().Tools, env.NewLocalEnv(t.TempDir()))
+	if len(tools) != 4 {
+		t.Fatalf("configured %d tools, want four", len(tools))
+	}
+	want := []string{"read", "write", "edit", "bash"}
+	for i, tool := range tools {
+		if got := tool.ToolName(); got != want[i] {
+			t.Fatalf("tool %d = %q, want %q", i, got, want[i])
+		}
+	}
+	specs := agent.ToolSpecs(tools)
+	if len(specs) != len(want) {
+		t.Fatalf("provider specs = %d, want %d", len(specs), len(want))
+	}
+	for i, spec := range specs {
+		if spec.Name != want[i] || len(spec.Parameters) == 0 {
+			t.Fatalf("provider spec %d = %#v, want named schema", i, spec)
+		}
+	}
+}
+
+func TestStreamPromptCoreToolRoundTripMutatesFileAndPersistsResults(t *testing.T) {
+	root := t.TempDir()
+	cwd := t.TempDir()
+	store := session.NewStore(root)
+	active, err := store.Create(context.Background(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := configuredTools(config.DefaultConfig().Tools, env.NewLocalEnv(cwd))
+	client := faux.NewClient(
+		faux.ToolCallMessage("write", "write-1", map[string]any{"path": "note.txt", "content": "old\n"}),
+		faux.ToolCallMessage("read", "read-1", map[string]any{"path": "note.txt"}),
+		faux.ToolCallMessage("edit", "edit-1", map[string]any{"path": "note.txt", "oldText": "old", "newText": "new"}),
+		faux.ToolCallMessage("bash", "bash-1", map[string]any{"command": "cat note.txt"}),
+		faux.TextMessage("finished the coding task"),
+	)
+	var stdout, stderr bytes.Buffer
+	if exitCode := streamPromptWithSession(client, config.DefaultConfig(), "update note.txt", configured, active, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("tool run failed: %d: %s", exitCode, stderr.String())
+	}
+	data, err := os.ReadFile(filepath.Join(cwd, "note.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new\n" {
+		t.Fatalf("file after tool round trip = %q, want new content", data)
+	}
+	if !strings.Contains(stdout.String(), "finished the coding task") {
+		t.Fatalf("final assistant output = %q", stdout.String())
+	}
+	for _, name := range []string{"write", "read", "edit", "bash"} {
+		if !strings.Contains(stderr.String(), "tool: "+name+" complete") {
+			t.Fatalf("stderr missing %s completion: %q", name, stderr.String())
+		}
+	}
+
+	reopened, err := store.OpenLatest(context.Background(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	messages := reopened.Messages()
+	if len(messages) != 10 {
+		t.Fatalf("persisted %d messages, want prompt plus five assistants and four results", len(messages))
+	}
+	wantRoles := []string{"user", "assistant", "toolResult", "assistant", "toolResult", "assistant", "toolResult", "assistant", "toolResult", "assistant"}
+	for i, wantRole := range wantRoles {
+		if got := messageRole(messages[i]); got != wantRole {
+			t.Fatalf("persisted message %d role = %q, want %q", i, got, wantRole)
+		}
+	}
+	for i, wantName := range []string{"write", "read", "edit", "bash"} {
+		result, ok := messages[2+i*2].(message.ToolResultMessage)
+		if !ok || result.ToolName != wantName || result.IsError {
+			t.Fatalf("persisted tool result %d = %#v, want successful %s", i, messages[2+i*2], wantName)
+		}
+	}
+}
+
 type recordingClient struct {
 	mu       sync.Mutex
 	inner    provider.ModelClient
@@ -337,4 +418,17 @@ func textContent(blocks []message.ContentBlock) string {
 		}
 	}
 	return ""
+}
+
+func messageRole(msg message.AgentMessage) string {
+	switch msg.(type) {
+	case message.UserMessage:
+		return "user"
+	case message.AssistantMessage:
+		return "assistant"
+	case message.ToolResultMessage:
+		return "toolResult"
+	default:
+		return "unknown"
+	}
 }

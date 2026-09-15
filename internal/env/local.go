@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 type LocalEnv struct {
@@ -13,9 +14,19 @@ type LocalEnv struct {
 }
 
 func NewLocalEnv(cwd string) *LocalEnv {
+	return NewLocalEnvWithShell(cwd, "/bin/bash")
+}
+
+// NewLocalEnvWithShell is the configurable constructor used by the CLI. An
+// empty shell path intentionally falls back to bash so existing callers do
+// not need to know about the new setting.
+func NewLocalEnvWithShell(cwd, shellPath string) *LocalEnv {
+	if strings.TrimSpace(shellPath) == "" {
+		shellPath = "/bin/bash"
+	}
 	return &LocalEnv{
 		cwd:       cwd,
-		shellPath: "/bin/bash",
+		shellPath: shellPath,
 	}
 }
 
