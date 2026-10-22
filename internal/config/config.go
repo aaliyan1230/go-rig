@@ -16,7 +16,10 @@ type ModelConfig struct {
 }
 
 type AgentConfig struct {
-	MaxTurns     int
+	MaxTurns int
+	// SystemPrompt, when non-empty, replaces the built-in preamble, tool
+	// list, and rules. Project context and cwd are still appended. Empty
+	// means use the default prompt from internal/prompt.
 	SystemPrompt string
 }
 
@@ -40,8 +43,7 @@ func DefaultConfig() Config {
 			MaxTokens: 4096,
 		},
 		Agent: AgentConfig{
-			MaxTurns:     10,
-			SystemPrompt: "You are a coding assistant. You help with software engineering tasks.\nUse the available tools to read, write, edit, and run bash commands.\nBe concise. Think before you act.",
+			MaxTurns: 10,
 		},
 		Tools: ToolConfig{
 			Read:  true,

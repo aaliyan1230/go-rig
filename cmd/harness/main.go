@@ -15,6 +15,7 @@ import (
 	"github.com/aaliyan1230/go-rig/internal/env"
 	"github.com/aaliyan1230/go-rig/internal/message"
 	"github.com/aaliyan1230/go-rig/internal/openai"
+	sysprompt "github.com/aaliyan1230/go-rig/internal/prompt"
 	"github.com/aaliyan1230/go-rig/internal/provider"
 	"github.com/aaliyan1230/go-rig/internal/session"
 	builtintools "github.com/aaliyan1230/go-rig/internal/tools"
@@ -105,7 +106,23 @@ func runWithOptions(cfg config.Config, prompt, apiKeyFlag, baseURL string, conti
 		return 1
 	}
 
-	return streamPromptWithSession(client, cfg, prompt, tools, activeSession, stdout, stderr)
+	system := systemPrompt(context.Background(), cfg.Agent, localEnv, tools, workingDir, stderr)
+	return streamPromptWithSession(client, cfg, system, prompt, tools, activeSession, stdout, stderr)
+}
+
+// systemPrompt loads project context files and renders the system prompt.
+// Unreadable context files are reported as warnings; they never stop a run.
+func systemPrompt(ctx context.Context, cfg config.AgentConfig, environment env.Env, tools []agent.Tool, workingDir string, stderr io.Writer) string {
+	contextFiles, warnings := sysprompt.LoadContextFiles(ctx, environment, workingDir)
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "warning: context file: %v\n", w)
+	}
+	return sysprompt.Build(sysprompt.Options{
+		CustomPrompt: cfg.SystemPrompt,
+		Tools:        tools,
+		ContextFiles: contextFiles,
+		Cwd:          workingDir,
+	})
 }
 
 func configuredTools(cfg config.ToolConfig, environment env.Env) []agent.Tool {
@@ -135,10 +152,10 @@ type sessionSink interface {
 }
 
 func streamPrompt(client provider.ModelClient, cfg config.Config, prompt string, tools []agent.Tool, stdout, stderr io.Writer) int {
-	return streamPromptWithSession(client, cfg, prompt, tools, nil, stdout, stderr)
+	return streamPromptWithSession(client, cfg, cfg.Agent.SystemPrompt, prompt, tools, nil, stdout, stderr)
 }
 
-func streamPromptWithSession(client provider.ModelClient, cfg config.Config, prompt string, tools []agent.Tool, activeSession sessionSink, stdout, stderr io.Writer) int {
+func streamPromptWithSession(client provider.ModelClient, cfg config.Config, systemPrompt, prompt string, tools []agent.Tool, activeSession sessionSink, stdout, stderr io.Writer) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	if activeSession != nil {
@@ -157,7 +174,7 @@ func streamPromptWithSession(client provider.ModelClient, cfg config.Config, pro
 		ctx,
 		client,
 		[]message.AgentMessage{promptMessage},
-		agent.AgentContext{SystemPrompt: cfg.Agent.SystemPrompt, Messages: sessionMessages(activeSession), Tools: tools},
+		agent.AgentContext{SystemPrompt: systemPrompt, Messages: sessionMessages(activeSession), Tools: tools},
 		agent.RunConfig{Model: cfg.Model.Name, MaxTokens: cfg.Model.MaxTokens, MaxTurns: cfg.Agent.MaxTurns},
 	)
 

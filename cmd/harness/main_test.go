@@ -109,6 +109,7 @@ func TestStreamPromptPersistsPromptAndCompletedMessages(t *testing.T) {
 	exitCode := streamPromptWithSession(
 		faux.NewClient(faux.TextMessage("persisted answer")),
 		config.DefaultConfig(),
+		"",
 		"remember this prompt",
 		nil,
 		active,
@@ -161,6 +162,7 @@ func TestStreamPromptPersistsToolRoundTripInOrder(t *testing.T) {
 	exitCode := streamPromptWithSession(
 		client,
 		config.DefaultConfig(),
+		"",
 		"read note.txt",
 		[]agent.Tool{builtintools.NewReadTool(env.NewLocalEnv(cwd))},
 		active,
@@ -230,7 +232,7 @@ func TestStreamPromptContinueReplaysHistoryToProvider(t *testing.T) {
 	}
 	client := &recordingClient{inner: faux.NewClient(faux.TextMessage("new answer"))}
 	var stdout, stderr bytes.Buffer
-	exitCode := streamPromptWithSession(client, config.DefaultConfig(), "new question", nil, active, &stdout, &stderr)
+	exitCode := streamPromptWithSession(client, config.DefaultConfig(), "", "new question", nil, active, &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("expected success, got %d: %s", exitCode, stderr.String())
 	}
@@ -279,7 +281,7 @@ func TestStreamPromptAppendFailureWarnsAndKeepsOutput(t *testing.T) {
 	client := faux.NewClient(faux.TextMessage("still visible"))
 	failing := &failingSession{err: errors.New("disk is full")}
 	var stdout, stderr bytes.Buffer
-	exitCode := streamPromptWithSession(client, config.DefaultConfig(), "hello", nil, failing, &stdout, &stderr)
+	exitCode := streamPromptWithSession(client, config.DefaultConfig(), "", "hello", nil, failing, &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("expected model output to succeed, got %d", exitCode)
 	}
@@ -333,7 +335,7 @@ func TestStreamPromptCoreToolRoundTripMutatesFileAndPersistsResults(t *testing.T
 		faux.TextMessage("finished the coding task"),
 	)
 	var stdout, stderr bytes.Buffer
-	if exitCode := streamPromptWithSession(client, config.DefaultConfig(), "update note.txt", configured, active, &stdout, &stderr); exitCode != 0 {
+	if exitCode := streamPromptWithSession(client, config.DefaultConfig(), "", "update note.txt", configured, active, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("tool run failed: %d: %s", exitCode, stderr.String())
 	}
 	data, err := os.ReadFile(filepath.Join(cwd, "note.txt"))
@@ -430,5 +432,41 @@ func messageRole(msg message.AgentMessage) string {
 		return "toolResult"
 	default:
 		return "unknown"
+	}
+}
+
+func TestSystemPromptIncludesProjectContextAndCwd(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("Always run go vet."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	environment := env.NewLocalEnv(cwd)
+	var stderr bytes.Buffer
+
+	got := systemPrompt(context.Background(), config.DefaultConfig().Agent, environment, configuredTools(config.DefaultConfig().Tools, environment), cwd, &stderr)
+
+	for _, want := range []string{"- read: Read file contents", "Always run go vet.", "<cwd>\n" + filepath.ToSlash(cwd) + "\n</cwd>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system prompt missing %q:\n%s", want, got)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected warnings: %s", stderr.String())
+	}
+}
+
+func TestSystemPromptCustomOverrideKeepsContext(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("project rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig().Agent
+	cfg.SystemPrompt = "Custom base."
+	var stderr bytes.Buffer
+
+	got := systemPrompt(context.Background(), cfg, env.NewLocalEnv(cwd), nil, cwd, &stderr)
+
+	if !strings.HasPrefix(got, "Custom base.") || !strings.Contains(got, "project rule") || strings.Contains(got, "<tools>") {
+		t.Errorf("custom prompt not applied as expected:\n%s", got)
 	}
 }
