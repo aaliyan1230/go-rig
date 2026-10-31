@@ -19,16 +19,16 @@ type apiRequest struct {
 // apiMessage represents a message in the OpenAI API format.
 // Content can be a string or an array of content parts (for images).
 type apiMessage struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content,omitempty"`
-	ToolCalls  []apiToolCall   `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role       string        `json:"role"`
+	Content    any           `json:"content,omitempty"`
+	ToolCalls  []apiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
 }
 
 type apiContentPart struct {
-	Type     string        `json:"type"`
-	Text     string        `json:"text,omitempty"`
-	ImageURL *apiImageURL  `json:"image_url,omitempty"`
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *apiImageURL `json:"image_url,omitempty"`
 }
 
 type apiImageURL struct {
@@ -161,6 +161,9 @@ func convertAssistantMessage(m message.AssistantMessage) apiMessage {
 
 	msg := apiMessage{
 		Role: "assistant",
+		// Failed requests can leave an empty assistant record in history.
+		// Send an explicit empty string rather than omitting content entirely.
+		Content: "",
 	}
 	if len(textParts) > 0 {
 		msg.Content = strings.Join(textParts, "\n")

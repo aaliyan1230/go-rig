@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type LocalEnv struct {
@@ -99,6 +100,9 @@ func (e *LocalEnv) Exec(ctx context.Context, command string, opts ExecOptions) (
 	}
 
 	cmd := exec.CommandContext(execCtx, e.shellPath, "-c", command)
+	configureCommandCancellation(cmd)
+	// A child that outlives its shell must not hold output pipes open forever.
+	cmd.WaitDelay = time.Second
 	cmd.Dir = e.cwd
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd

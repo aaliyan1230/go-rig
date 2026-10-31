@@ -35,6 +35,21 @@ func TestConvertMessages_NoSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestEmptyFailedAssistantHasExplicitContent(t *testing.T) {
+	converted := convertAssistantMessage(message.AssistantMessage{StopReason: message.StopReasonError})
+	encoded, err := json.Marshal(converted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["content"]) != `""` {
+		t.Fatalf("empty failed assistant cannot be replayed: %s", encoded)
+	}
+}
+
 func TestConvertUserMessage_TextOnly(t *testing.T) {
 	msgs := convertMessages("", []message.Message{
 		message.UserMessage{

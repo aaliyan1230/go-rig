@@ -33,6 +33,8 @@ type RunConfig struct {
 
 // Run starts a single agent run. Events are emitted in lifecycle order and the
 // returned channel is closed after AgentEnd. Cancelling ctx stops new work.
+// Consumers must drain the channel through closure, including after cancellation:
+// final messages and tool outcomes are delivered reliably for session replay.
 func Run(
 	ctx context.Context,
 	client provider.ModelClient,
@@ -61,7 +63,7 @@ func run(
 		Messages:     append([]message.AgentMessage(nil), initial.Messages...),
 		Tools:        append([]Tool(nil), initial.Tools...),
 	}
-	newMessages := append([]message.AgentMessage(nil), prompts...)
+	newMessages := make([]message.AgentMessage, 0, len(prompts))
 
 	if !emit(ctx, ch, AgentStart{}) {
 		emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ctx.Err()})
@@ -95,10 +97,9 @@ func run(
 		if !promptsAdded {
 			for _, prompt := range prompts {
 				working.Messages = append(working.Messages, prompt)
-				if !emit(ctx, ch, MessageStart{Message: prompt}) || !emit(ctx, ch, MessageEnd{Message: prompt}) {
-					emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ctx.Err()})
-					return
-				}
+				newMessages = append(newMessages, prompt)
+				emitTerminal(ch, MessageStart{Message: prompt})
+				emitTerminal(ch, MessageEnd{Message: prompt})
 			}
 			promptsAdded = true
 		}
@@ -108,7 +109,7 @@ func run(
 		working.Messages = append(working.Messages, assistant)
 		newMessages = append(newMessages, assistant)
 		if streamErr != nil {
-			emit(ctx, ch, TurnEnd{Message: assistant})
+			emitTerminal(ch, TurnEnd{Message: assistant})
 			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: streamErr})
 			return
 		}
@@ -119,15 +120,9 @@ func run(
 			toolResults = append(toolResults, result)
 			working.Messages = append(working.Messages, result)
 			newMessages = append(newMessages, result)
-			if ctx.Err() != nil {
-				break
-			}
 		}
 
-		if !emit(ctx, ch, TurnEnd{Message: assistant, ToolResults: toolResults}) {
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ctx.Err()})
-			return
-		}
+		emitTerminal(ch, TurnEnd{Message: assistant, ToolResults: toolResults})
 		if err := ctx.Err(); err != nil {
 			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: err})
 			return
@@ -160,37 +155,54 @@ func streamAssistant(
 	}
 	started := false
 	toolBlocks := make(map[int]int)
-	start := func(msg message.AssistantMessage) bool {
+	start := func(msg message.AssistantMessage) {
 		if started {
-			return true
+			return
 		}
 		partial = msg
 		started = true
-		return emit(ctx, ch, MessageStart{Message: cloneAssistantMessage(partial)})
+		emitTerminal(ch, MessageStart{Message: cloneAssistantMessage(partial)})
 	}
 	finish := func(msg message.AssistantMessage, err error) (message.AssistantMessage, error) {
-		if !start(msg) {
-			return msg, ctx.Err()
+		if err != nil {
+			// An interrupted tool-call stream may contain invalid JSON or calls
+			// that were never finalized. Keep text, but never replay those calls.
+			content := make([]message.ContentBlock, 0, len(msg.Content))
+			for _, block := range msg.Content {
+				if _, call := block.(message.ToolCall); !call {
+					content = append(content, block)
+				}
+			}
+			msg.Content = content
+			msg.StopReason = message.StopReasonError
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				msg.StopReason = message.StopReasonAborted
+			}
+			if msg.ErrorMessage == "" {
+				msg.ErrorMessage = err.Error()
+			}
 		}
-		if !emit(ctx, ch, MessageEnd{Message: msg}) {
-			return msg, ctx.Err()
-		}
+		start(msg)
+		emitTerminal(ch, MessageEnd{Message: msg})
 		return msg, err
+	}
+	abort := func() (message.AssistantMessage, error) {
+		partial.ErrorMessage = "request was aborted"
+		return finish(partial, ctx.Err())
+	}
+	if ctx.Err() != nil {
+		return abort()
 	}
 
 	events := client.Stream(ctx, params)
 	for {
 		select {
 		case <-ctx.Done():
-			partial.StopReason = message.StopReasonAborted
-			partial.ErrorMessage = "request was aborted"
-			return finish(partial, ctx.Err())
+			return abort()
 		case event, ok := <-events:
 			if !ok {
 				if err := ctx.Err(); err != nil {
-					partial.StopReason = message.StopReasonAborted
-					partial.ErrorMessage = "request was aborted"
-					return finish(partial, err)
+					return abort()
 				}
 				partial.StopReason = message.StopReasonError
 				partial.ErrorMessage = "model stream closed without a terminal event"
@@ -199,37 +211,35 @@ func streamAssistant(
 
 			switch e := event.(type) {
 			case provider.StreamStart:
-				if !start(partial) {
-					return partial, ctx.Err()
-				}
+				start(partial)
 			case provider.TextDelta:
-				if !start(partial) {
-					return partial, ctx.Err()
-				}
+				start(partial)
 				appendTextDelta(&partial, e.Delta)
 				if !emit(ctx, ch, MessageUpdate{Message: cloneAssistantMessage(partial), Event: e}) {
-					return partial, ctx.Err()
+					return abort()
 				}
 			case provider.ToolCallStart:
-				if !start(partial) {
-					return partial, ctx.Err()
-				}
+				start(partial)
 				toolBlocks[e.Index] = len(partial.Content)
 				partial.Content = append(partial.Content, message.ToolCall{ID: e.ID, Name: e.Name, Arguments: json.RawMessage{}})
 				if !emit(ctx, ch, MessageUpdate{Message: cloneAssistantMessage(partial), Event: e}) {
-					return partial, ctx.Err()
+					return abort()
 				}
 			case provider.ToolCallDelta:
-				if !start(partial) {
-					return partial, ctx.Err()
-				}
+				start(partial)
 				appendToolCallDelta(&partial, toolBlocks, e.Index, e.Delta)
 				if !emit(ctx, ch, MessageUpdate{Message: cloneAssistantMessage(partial), Event: e}) {
-					return partial, ctx.Err()
+					return abort()
 				}
 			case provider.StreamDone:
 				return finish(e.Message, nil)
 			case provider.StreamError:
+				if ctx.Err() != nil {
+					return abort()
+				}
+				if len(e.Message.Content) == 0 {
+					e.Message.Content = partial.Content
+				}
 				return finish(e.Message, e.Err)
 			}
 		}
@@ -237,17 +247,22 @@ func streamAssistant(
 }
 
 func executeToolCall(ctx context.Context, ch chan<- AgentEvent, tools []Tool, call message.ToolCall) message.ToolResultMessage {
-	if !emit(ctx, ch, ToolExecStart{ToolCallID: call.ID, ToolName: call.Name, Args: call.Arguments}) {
-		return errorToolResult(call, ctx.Err())
+	if ctx.Err() == nil {
+		emitTerminal(ch, ToolExecStart{ToolCallID: call.ID, ToolName: call.Name, Args: call.Arguments})
 	}
-
 	tool := findTool(tools, call.Name)
 	var result ToolResult
 	var err error
-	if tool == nil {
+	if ctx.Err() != nil {
+		err = fmt.Errorf("not executed: canceled: %w", ctx.Err())
+	} else if tool == nil {
 		err = fmt.Errorf("tool %q was not found", call.Name)
 	} else {
-		result, err = tool.Execute(ctx, call.ID, call.Arguments)
+		if ctx.Err() != nil {
+			err = fmt.Errorf("not executed: canceled: %w", ctx.Err())
+		} else {
+			result, err = tool.Execute(ctx, call.ID, call.Arguments)
+		}
 	}
 
 	toolResult := message.ToolResultMessage{
@@ -261,9 +276,9 @@ func executeToolCall(ctx context.Context, ch chan<- AgentEvent, tools []Tool, ca
 		toolResult = errorToolResult(call, err)
 	}
 
-	emit(ctx, ch, ToolExecEnd{ToolCallID: call.ID, ToolName: call.Name, Result: resultForEvent(toolResult), IsError: toolResult.IsError})
-	emit(ctx, ch, MessageStart{Message: toolResult})
-	emit(ctx, ch, MessageEnd{Message: toolResult})
+	emitTerminal(ch, ToolExecEnd{ToolCallID: call.ID, ToolName: call.Name, Result: resultForEvent(toolResult), IsError: toolResult.IsError})
+	emitTerminal(ch, MessageStart{Message: toolResult})
+	emitTerminal(ch, MessageEnd{Message: toolResult})
 	return toolResult
 }
 
