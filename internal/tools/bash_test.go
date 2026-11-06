@@ -73,6 +73,20 @@ func TestBashToolUsesThirtySecondDefault(t *testing.T) {
 	}
 }
 
+func TestBashConfiguredDefaultAndPerCallOverride(t *testing.T) {
+	fake := &bashTestEnv{cwd: "/project"}
+	tool := NewBashToolWithTimeout(fake, 75)
+	if _, err := tool.Execute(context.Background(), "call", json.RawMessage(`{"command":"true"}`)); err != nil || fake.gotOpts.Timeout != 75*time.Second {
+		t.Fatal(fake.gotOpts, err)
+	}
+	if _, err := tool.Execute(context.Background(), "call", json.RawMessage(`{"command":"true","timeout":120}`)); err != nil || fake.gotOpts.Timeout != 120*time.Second {
+		t.Fatal(fake.gotOpts, err)
+	}
+	if !strings.Contains(tool.ToolDescription(), "75 seconds") || !strings.Contains(string(tool.ToolSchema()), "default: 75") {
+		t.Fatal("model metadata has stale timeout")
+	}
+}
+
 func TestBashToolEmptyOutput(t *testing.T) {
 	tool := NewBashTool(&bashTestEnv{cwd: "/project"})
 	result, err := tool.Execute(context.Background(), "call-1", json.RawMessage(`{"command":"true"}`))

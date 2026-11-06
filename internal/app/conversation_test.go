@@ -51,7 +51,7 @@ func createSession(t *testing.T) (*session.Store, *session.Session, string) {
 
 func prompt(t *testing.T, c *Conversation, text string) {
 	t.Helper()
-	if err := c.Prompt(context.Background(), text, nil); err != nil {
+	if _, err := c.Prompt(context.Background(), text, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -143,7 +143,7 @@ func TestNewSessionIsTransactionalAndRebuildsPrompt(t *testing.T) {
 		return store.Create(ctx, cwd)
 	}
 	builds := 0
-	opts.BuildSystemPrompt = func(context.Context) string { builds++; return "new instructions" }
+	opts.BuildSystemPrompt = func(context.Context) (string, error) { builds++; return "new instructions", nil }
 	c := New(opts)
 	defer c.Close()
 	prompt(t, c, "one")
@@ -154,14 +154,14 @@ func TestNewSessionIsTransactionalAndRebuildsPrompt(t *testing.T) {
 	if c.NewSession(context.Background()) == nil {
 		t.Fatal("expected creation error")
 	}
-	if c.Info() != before || builds != 0 {
+	if c.Info() != before || builds != 1 {
 		t.Fatal("failed /new changed conversation")
 	}
 	fail = false
 	if err := c.NewSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if c.Info().Metadata.ID == before.Metadata.ID || c.Info().MessageCount != 0 || c.Info().Model != "next-model" || !c.Info().PersistenceEnabled || builds != 1 {
+	if c.Info().Metadata.ID == before.Metadata.ID || c.Info().MessageCount != 0 || c.Info().Model != "next-model" || !c.Info().PersistenceEnabled || builds != 2 {
 		t.Fatal(c.Info())
 	}
 	if err := s.Append(context.Background(), message.UserMessage{}); err == nil {
@@ -188,7 +188,7 @@ func TestProviderErrorDoesNotPreventNextPrompt(t *testing.T) {
 	})}
 	c := New(options(client, nil))
 	defer c.Close()
-	if err := c.Prompt(context.Background(), "first", nil); err == nil {
+	if _, err := c.Prompt(context.Background(), "first", nil); err == nil {
 		t.Fatal("expected error")
 	}
 	prompt(t, c, "try again")
@@ -211,8 +211,8 @@ func TestTurnLimitResetsForEachUserPrompt(t *testing.T) {
 	opts.Tools = []agent.Tool{tools.NewReadTool(env.NewLocalEnv(cwd))}
 	c := New(opts)
 	defer c.Close()
-	if err := c.Prompt(context.Background(), "read", nil); !errors.Is(err, agent.ErrMaxTurns) {
-		t.Fatalf("expected turn limit, got %v", err)
+	if result, err := c.Prompt(context.Background(), "read", nil); err != nil || result.Status != agent.EndTurnLimit {
+		t.Fatalf("expected pause, got %+v %v", result, err)
 	}
 	prompt(t, c, "summarize")
 	if len(client.requests) != 2 || len(client.requests[1].Messages) != 4 || c.Info().MessageCount != 5 {
@@ -237,7 +237,7 @@ func TestFailedStreamDoesNotPersistUnfinishedToolCalls(t *testing.T) {
 				return ch
 			})
 			c := New(options(client, s))
-			if c.Prompt(context.Background(), "start", nil) == nil {
+			if _, err := c.Prompt(context.Background(), "start", nil); err == nil {
 				t.Fatal("expected stream failure")
 			}
 			if !c.Info().PersistenceEnabled {
@@ -285,7 +285,7 @@ func TestCancelStreamPersistsOnlyAvailableTextAndCanResume(t *testing.T) {
 				return ch
 			})
 			c := New(options(client, s))
-			err := c.Prompt(ctx, "start", func(event agent.AgentEvent) {
+			_, err := c.Prompt(ctx, "start", func(event agent.AgentEvent) {
 				if update, ok := event.(agent.MessageUpdate); ok {
 					_, isCall := update.Event.(provider.ToolCallDelta)
 					_, isText := update.Event.(provider.TextDelta)
@@ -350,7 +350,7 @@ func TestCancelToolBatchKeepsCompletedEffectAndClosesAllCalls(t *testing.T) {
 	opts := options(faux.NewClient(assistant), s)
 	opts.Tools = []agent.Tool{tool}
 	c := New(opts)
-	if err := c.Prompt(ctx, "change", nil); !errors.Is(err, context.Canceled) {
+	if _, err := c.Prompt(ctx, "change", nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
 	if tool.calls != 1 || c.Info().MessageCount != 4 {
@@ -386,12 +386,12 @@ func TestConversationRejectsInvalidInputAndClosesOnce(t *testing.T) {
 			t.Fatalf("accepted %q", name)
 		}
 	}
-	if c.Prompt(context.Background(), "  ", nil) == nil {
+	if _, err := c.Prompt(context.Background(), "  ", nil); err == nil {
 		t.Fatal("accepted blank prompt")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if !errors.Is(c.Prompt(ctx, "hello", nil), context.Canceled) || c.Info().MessageCount != 0 {
+	if _, err := c.Prompt(ctx, "hello", nil); !errors.Is(err, context.Canceled) || c.Info().MessageCount != 0 {
 		t.Fatal("already canceled prompt added history")
 	}
 	c.Close()
@@ -399,7 +399,8 @@ func TestConversationRejectsInvalidInputAndClosesOnce(t *testing.T) {
 	if s.closeCalls != 1 {
 		t.Fatal("session closed more than once")
 	}
-	if c.Prompt(context.Background(), "hello", nil) == nil || c.SetModel("other") == nil || c.NewSession(context.Background()) == nil {
+	_, err := c.Prompt(context.Background(), "hello", nil)
+	if err == nil || c.SetModel("other") == nil || c.NewSession(context.Background()) == nil {
 		t.Fatal("closed conversation accepted work")
 	}
 }

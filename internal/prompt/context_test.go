@@ -129,3 +129,27 @@ func TestLoadContextFilesNoneFound(t *testing.T) {
 		t.Fatalf("want nothing, got files=%+v warnings=%v", files, warnings)
 	}
 }
+
+type metadataOnlyEnv struct {
+	env.Env
+	reads int
+}
+
+func (e *metadataOnlyEnv) ReadFile(ctx context.Context, path string) ([]byte, error) {
+	e.reads++
+	return e.Env.ReadFile(ctx, path)
+}
+
+func TestDiscoveryDoesNotReadInstructionContent(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "AGENTS.md"), "private instructions")
+	e := &metadataOnlyEnv{Env: env.NewLocalEnv(root)}
+	paths, warnings := prompt.DiscoverContextFiles(context.Background(), e, root)
+	if len(warnings) != 0 || len(paths) == 0 || e.reads != 0 {
+		t.Fatal(paths, warnings, e.reads)
+	}
+	files, warnings := prompt.ReadContextFiles(context.Background(), e, paths)
+	if len(warnings) != 0 || len(files) == 0 || e.reads != len(paths) {
+		t.Fatal(files, warnings, e.reads)
+	}
+}

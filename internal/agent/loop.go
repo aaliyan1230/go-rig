@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	ErrNoPrompts = errors.New("agent requires at least one prompt")
-	ErrMaxTurns  = errors.New("maximum agent turns reached")
+	ErrNoPrompts      = errors.New("agent requires at least one prompt")
+	ErrInvalidConfig  = errors.New("invalid agent configuration")
+	ErrCannotContinue = errors.New("history must end in a user message or a completed tool-result batch")
 )
 
 // AgentContext is the provider-independent state available to one run.
@@ -26,10 +27,14 @@ type AgentContext struct {
 
 // RunConfig controls provider requests made by the agent loop.
 type RunConfig struct {
-	Model     string
-	MaxTokens int
-	MaxTurns  int
+	Model          string
+	MaxTokens      int
+	MaxTurns       int
+	BeforeToolCall func(context.Context, message.ToolCall) error
+	OnTurnLimit    func(context.Context, TurnLimitInfo) (bool, error)
 }
+
+type TurnLimitInfo struct{ Turns, BatchSize int }
 
 // Run starts a single agent run. Events are emitted in lifecycle order and the
 // returned channel is closed after AgentEnd. Cancelling ctx stops new work.
@@ -45,9 +50,49 @@ func Run(
 	ch := make(chan AgentEvent, 1)
 	go func() {
 		defer close(ch)
-		run(ctx, client, prompts, initial, cfg, ch)
+		run(ctx, client, prompts, initial, cfg, ch, false)
 	}()
 	return ch
+}
+
+// Continue resumes the existing transcript without inventing another user prompt.
+func Continue(ctx context.Context, client provider.ModelClient, initial AgentContext, cfg RunConfig) <-chan AgentEvent {
+	ch := make(chan AgentEvent, 1)
+	go func() { defer close(ch); run(ctx, client, nil, initial, cfg, ch, true) }()
+	return ch
+}
+
+func CanContinue(messages []message.AgentMessage) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	switch messages[len(messages)-1].(type) {
+	case message.UserMessage:
+		return true
+	case message.ToolResultMessage:
+		var results []message.ToolResultMessage
+		for i := len(messages) - 1; i >= 0; i-- {
+			if r, ok := messages[i].(message.ToolResultMessage); ok {
+				results = append(results, r)
+				continue
+			}
+			a, ok := messages[i].(message.AssistantMessage)
+			if !ok || a.StopReason != message.StopReasonToolUse {
+				return false
+			}
+			calls := toolCalls(a)
+			if len(calls) != len(results) || len(calls) == 0 {
+				return false
+			}
+			for j, call := range calls {
+				if call.ID != results[len(results)-1-j].ToolCallID {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func run(
@@ -57,6 +102,7 @@ func run(
 	initial AgentContext,
 	cfg RunConfig,
 	ch chan<- AgentEvent,
+	continuing bool,
 ) {
 	working := AgentContext{
 		SystemPrompt: initial.SystemPrompt,
@@ -64,34 +110,64 @@ func run(
 		Tools:        append([]Tool(nil), initial.Tools...),
 	}
 	newMessages := make([]message.AgentMessage, 0, len(prompts))
+	turns := 0
+	finish := func(reason EndReason, err error) {
+		if err != nil {
+			reason = EndError
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				reason = EndCanceled
+			}
+		}
+		emitTerminal(ch, AgentEnd{Messages: newMessages, Reason: reason, Turns: turns, Err: err})
+	}
 
 	if !emit(ctx, ch, AgentStart{}) {
-		emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ctx.Err()})
+		finish(EndCanceled, ctx.Err())
 		return
 	}
-	if len(prompts) == 0 {
-		emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ErrNoPrompts})
+	if continuing && !CanContinue(initial.Messages) {
+		finish(EndError, ErrCannotContinue)
+		return
+	}
+	if !continuing && len(prompts) == 0 {
+		finish(EndError, ErrNoPrompts)
 		return
 	}
 	if cfg.MaxTurns <= 0 {
-		emitTerminal(ch, AgentEnd{Messages: newMessages, Err: fmt.Errorf("%w: must be greater than zero", ErrMaxTurns)})
+		finish(EndError, fmt.Errorf("%w: max turns must be greater than zero", ErrInvalidConfig))
 		return
 	}
 
-	turns := 0
 	promptsAdded := false
+	windowTurns := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: err})
+			finish(EndCanceled, err)
 			return
 		}
-		if turns >= cfg.MaxTurns {
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ErrMaxTurns})
-			return
+		if windowTurns >= cfg.MaxTurns {
+			allow := false
+			var err error
+			if cfg.OnTurnLimit != nil {
+				allow, err = cfg.OnTurnLimit(ctx, TurnLimitInfo{Turns: turns, BatchSize: cfg.MaxTurns})
+			}
+			if err != nil {
+				finish(EndError, err)
+				return
+			}
+			if ctx.Err() != nil {
+				finish(EndCanceled, ctx.Err())
+				return
+			}
+			if !allow {
+				finish(EndTurnLimit, nil)
+				return
+			}
+			windowTurns = 0
 		}
 
 		if !emit(ctx, ch, TurnStart{}) {
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: ctx.Err()})
+			finish(EndCanceled, ctx.Err())
 			return
 		}
 		if !promptsAdded {
@@ -104,19 +180,20 @@ func run(
 			promptsAdded = true
 		}
 		turns++
+		windowTurns++
 
 		assistant, streamErr := streamAssistant(ctx, ch, client, working, cfg)
 		working.Messages = append(working.Messages, assistant)
 		newMessages = append(newMessages, assistant)
 		if streamErr != nil {
 			emitTerminal(ch, TurnEnd{Message: assistant})
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: streamErr})
+			finish(EndError, streamErr)
 			return
 		}
 
 		toolResults := make([]message.ToolResultMessage, 0)
 		for _, call := range toolCalls(assistant) {
-			result := executeToolCall(ctx, ch, working.Tools, call)
+			result := executeToolCall(ctx, ch, working.Tools, call, cfg.BeforeToolCall)
 			toolResults = append(toolResults, result)
 			working.Messages = append(working.Messages, result)
 			newMessages = append(newMessages, result)
@@ -124,11 +201,11 @@ func run(
 
 		emitTerminal(ch, TurnEnd{Message: assistant, ToolResults: toolResults})
 		if err := ctx.Err(); err != nil {
-			emitTerminal(ch, AgentEnd{Messages: newMessages, Err: err})
+			finish(EndCanceled, err)
 			return
 		}
 		if len(toolResults) == 0 {
-			emitTerminal(ch, AgentEnd{Messages: newMessages})
+			finish(EndCompleted, nil)
 			return
 		}
 	}
@@ -246,7 +323,7 @@ func streamAssistant(
 	}
 }
 
-func executeToolCall(ctx context.Context, ch chan<- AgentEvent, tools []Tool, call message.ToolCall) message.ToolResultMessage {
+func executeToolCall(ctx context.Context, ch chan<- AgentEvent, tools []Tool, call message.ToolCall, before func(context.Context, message.ToolCall) error) message.ToolResultMessage {
 	if ctx.Err() == nil {
 		emitTerminal(ch, ToolExecStart{ToolCallID: call.ID, ToolName: call.Name, Args: call.Arguments})
 	}
@@ -258,9 +335,12 @@ func executeToolCall(ctx context.Context, ch chan<- AgentEvent, tools []Tool, ca
 	} else if tool == nil {
 		err = fmt.Errorf("tool %q was not found", call.Name)
 	} else {
-		if ctx.Err() != nil {
+		if before != nil {
+			err = before(ctx, call)
+		}
+		if err == nil && ctx.Err() != nil {
 			err = fmt.Errorf("not executed: canceled: %w", ctx.Err())
-		} else {
+		} else if err == nil {
 			result, err = tool.Execute(ctx, call.ID, call.Arguments)
 		}
 	}

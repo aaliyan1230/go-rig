@@ -22,16 +22,23 @@ var contextFileNames = []string{"AGENTS.md", "CLAUDE.md"}
 // returned as a warning and loading continues: a broken instruction file
 // should not stop the harness from starting.
 func LoadContextFiles(ctx context.Context, environment env.Env, cwd string) ([]ContextFile, []error) {
-	var files []ContextFile
+	paths, warnings := DiscoverContextFiles(ctx, environment, cwd)
+	files, readWarnings := ReadContextFiles(ctx, environment, paths)
+	return files, append(warnings, readWarnings...)
+}
+
+// DiscoverContextFiles inspects names and metadata, never instruction content.
+func DiscoverContextFiles(ctx context.Context, environment env.Env, cwd string) ([]string, []error) {
+	var paths []string
 	var warnings []error
 	dir := filepath.Clean(cwd)
 	for {
-		file, ok, err := loadContextFileFromDir(ctx, environment, dir)
+		path, ok, err := discoverContextFileFromDir(ctx, environment, dir)
 		if err != nil {
 			warnings = append(warnings, err)
 		}
 		if ok {
-			files = append(files, file)
+			paths = append(paths, path)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -41,13 +48,27 @@ func LoadContextFiles(ctx context.Context, environment env.Env, cwd string) ([]C
 	}
 
 	// Collected innermost first; reverse so the root-most file comes first.
-	for i, j := 0, len(files)-1; i < j; i, j = i+1, j-1 {
-		files[i], files[j] = files[j], files[i]
+	for i, j := 0, len(paths)-1; i < j; i, j = i+1, j-1 {
+		paths[i], paths[j] = paths[j], paths[i]
+	}
+	return paths, warnings
+}
+
+func ReadContextFiles(ctx context.Context, environment env.Env, paths []string) ([]ContextFile, []error) {
+	var files []ContextFile
+	var warnings []error
+	for _, path := range paths {
+		data, err := environment.ReadFile(ctx, path)
+		if err != nil {
+			warnings = append(warnings, err)
+			continue
+		}
+		files = append(files, ContextFile{Path: path, Content: strings.TrimPrefix(string(data), "\uFEFF")})
 	}
 	return files, warnings
 }
 
-func loadContextFileFromDir(ctx context.Context, environment env.Env, dir string) (ContextFile, bool, error) {
+func discoverContextFileFromDir(ctx context.Context, environment env.Env, dir string) (string, bool, error) {
 	for _, name := range contextFileNames {
 		path := filepath.Join(dir, name)
 		info, err := environment.Stat(ctx, path)
@@ -55,16 +76,12 @@ func loadContextFileFromDir(ctx context.Context, environment env.Env, dir string
 			continue
 		}
 		if err != nil {
-			return ContextFile{}, false, err
+			return "", false, err
 		}
 		if info.IsDir {
 			continue
 		}
-		data, err := environment.ReadFile(ctx, path)
-		if err != nil {
-			return ContextFile{}, false, err
-		}
-		return ContextFile{Path: path, Content: strings.TrimPrefix(string(data), "\uFEFF")}, true, nil
+		return path, true, nil
 	}
-	return ContextFile{}, false, nil
+	return "", false, nil
 }

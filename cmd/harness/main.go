@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/aaliyan1230/go-rig/internal/env"
 	"github.com/aaliyan1230/go-rig/internal/message"
 	"github.com/aaliyan1230/go-rig/internal/openai"
+	"github.com/aaliyan1230/go-rig/internal/policy"
 	sysprompt "github.com/aaliyan1230/go-rig/internal/prompt"
 	"github.com/aaliyan1230/go-rig/internal/provider"
 	"github.com/aaliyan1230/go-rig/internal/session"
@@ -27,6 +29,7 @@ func main() {
 }
 
 func cli(args []string, stdin *os.File, stdout, stderr io.Writer) int {
+	cfg := config.DefaultConfig()
 	flags := flag.NewFlagSet("harness", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	prompt := flags.String("p", "", "prompt to send (print mode; omit for interactive mode)")
@@ -35,6 +38,16 @@ func cli(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	baseURL := flags.String("base-url", "", "API base URL")
 	continueSession := flags.Bool("continue", false, "continue the newest session for the working directory")
 	sessionDir := flags.String("session-dir", "", "base directory for sessions (default: user config directory)")
+	controls := policy.Defaults()
+	toolList := flags.String("tools", "", "comma-separated exact tool allowlist")
+	flags.StringVar(&controls.ExcludeTools, "exclude-tools", "", "comma-separated tool denylist")
+	flags.BoolVar(&controls.NoTools, "no-tools", false, "disable all tools")
+	flags.StringVar(&controls.Approval, "approval", "none", "tool approval: none or ask")
+	flags.StringVar(&controls.PathScope, "path-scope", "all", "filesystem scope: all or workspace (does not constrain bash)")
+	flags.StringVar(&controls.ProjectTrust, "project-trust", "auto", "project instructions: auto, ask, yes, or no")
+	flags.BoolVar(&controls.NoContextFiles, "no-context-files", false, "skip project instruction discovery")
+	maxTurns := flags.Int("max-turns", cfg.Agent.MaxTurns, "model requests per renewable batch")
+	bashTimeout := flags.Int("bash-timeout", cfg.Env.BashTimeout, "default bash timeout in seconds; a tool call may override it")
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -46,7 +59,18 @@ func cli(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		if f.Name == "p" {
 			printMode = true
 		}
+		if f.Name == "tools" {
+			controls.Tools = toolList
+		}
 	})
+	if err := controls.Validate(); err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if *maxTurns <= 0 || *bashTimeout <= 0 {
+		fmt.Fprintln(stderr, "error: --max-turns and --bash-timeout must be positive")
+		return 1
+	}
 	if flags.NArg() != 0 || (printMode && *prompt == "") {
 		fmt.Fprintln(stderr, "usage: harness [-p \"your prompt\"] [flags]")
 		return 1
@@ -58,26 +82,55 @@ func cli(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	cfg := config.DefaultConfig()
+	cfg.Agent.MaxTurns = *maxTurns
+	cfg.Env.BashTimeout = *bashTimeout
 	if *model != "" {
 		cfg.Model.Name = *model
 	}
 
+	var input *readlineInput
+	var confirm policy.Confirm
+	editorOutput := stdout
 	if printMode {
-		return runWithOptions(cfg, *prompt, *apiKey, *baseURL, *continueSession, *sessionDir, stdout, stderr)
+		editorOutput = stderr
 	}
-	conversation, err := openConversation(cfg, *apiKey, *baseURL, *continueSession, *sessionDir, stderr)
+	if errFile, ok := stderr.(*os.File); ok && readline.IsTerminal(int(stdin.Fd())) && readline.IsTerminal(int(errFile.Fd())) {
+		var err error
+		input, err = newReadlineInput(stdin, editorOutput, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: terminal input: %v\n", err)
+			return 1
+		}
+		defer input.Close()
+		confirm = input.Confirm
+	}
+	// Interactive stdout is already checked above; stderr may be redirected.
+	if !printMode && input == nil {
+		var err error
+		input, err = newReadlineInput(stdin, stdout, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: terminal input: %v\n", err)
+			return 1
+		}
+		defer input.Close()
+		confirm = input.Confirm
+	}
+	conversation, err := openConversationControlled(cfg, *apiKey, *baseURL, *continueSession, *sessionDir, controls, confirm, stderr)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0
+		}
+		if errors.Is(err, context.Canceled) {
+			return 1
+		}
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 	defer closeConversation(conversation, stderr)
-	input, err := newReadlineInput(stdin, stdout, stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: terminal input: %v\n", err)
-		return 1
+	if printMode {
+		fmt.Fprintln(stderr, conversation.Info().Controls)
+		return printPrompt(conversation, *prompt, stdout, stderr)
 	}
-	defer input.Close()
 	return interactiveLoop(conversation, input, stdout, stderr, interruptContext)
 }
 
@@ -101,6 +154,10 @@ func runWithOptions(cfg config.Config, prompt, apiKeyFlag, baseURL string, conti
 }
 
 func openConversation(cfg config.Config, apiKeyFlag, baseURL string, continueSession bool, sessionDir string, stderr io.Writer) (*app.Conversation, error) {
+	return openConversationControlled(cfg, apiKeyFlag, baseURL, continueSession, sessionDir, policy.Defaults(), nil, stderr)
+}
+
+func openConversationControlled(cfg config.Config, apiKeyFlag, baseURL string, continueSession bool, sessionDir string, controls policy.Controls, confirm policy.Confirm, stderr io.Writer) (*app.Conversation, error) {
 	key, err := openai.ResolveAPIKey(apiKeyFlag)
 	if err != nil {
 		return nil, err
@@ -124,7 +181,6 @@ func openConversation(cfg config.Config, apiKeyFlag, baseURL string, continueSes
 	}
 	workingDir = filepath.Clean(workingDir)
 	localEnv := env.NewLocalEnvWithShell(workingDir, cfg.Env.ShellPath)
-	tools := configuredTools(cfg.Tools, localEnv)
 
 	if sessionDir == "" {
 		sessionDir, err = os.UserConfigDir()
@@ -133,6 +189,60 @@ func openConversation(cfg config.Config, apiKeyFlag, baseURL string, continueSes
 		}
 	} else if !filepath.IsAbs(sessionDir) {
 		sessionDir = filepath.Join(workingDir, sessionDir)
+	}
+	var environment env.Env = localEnv
+	var cleanup func() error
+	if controls.PathScope == "workspace" {
+		workspace, err := env.NewWorkspaceEnv(workingDir, cfg.Env.ShellPath)
+		if err != nil {
+			return nil, err
+		}
+		environment = workspace
+		cleanup = workspace.Close
+	}
+	succeeded := false
+	defer func() {
+		if !succeeded && cleanup != nil {
+			cleanup()
+		}
+	}()
+	all := configuredTools(config.ToolConfig{Read: true, Write: true, Edit: true, Bash: true}, environment)
+	defaults := configuredTools(cfg.Tools, environment)
+	for i, t := range all {
+		if t.ToolName() == "bash" {
+			all[i] = builtintools.NewBashToolWithTimeout(environment, cfg.Env.BashTimeout)
+		}
+	}
+	tools, err := policy.Select(all, defaults, controls)
+	if err != nil {
+		return nil, err
+	}
+	summary := controls.Summary(tools)
+	warn := func(err error) { fmt.Fprintf(stderr, "warning: %v\n", err) }
+	trust := &policy.TrustStore{Base: sessionDir}
+	build := func(ctx context.Context) (string, error) {
+		var files []sysprompt.ContextFile
+		if !controls.NoContextFiles {
+			paths, warnings := sysprompt.DiscoverContextFiles(ctx, localEnv, workingDir)
+			for _, w := range warnings {
+				warn(w)
+			}
+			allow, err := trust.Resolve(ctx, controls.ProjectTrust, workingDir, paths, confirm, warn)
+			if err != nil {
+				return "", err
+			}
+			if allow {
+				files, warnings = sysprompt.ReadContextFiles(ctx, localEnv, paths)
+				for _, w := range warnings {
+					warn(w)
+				}
+			}
+		}
+		return sysprompt.Build(sysprompt.Options{CustomPrompt: cfg.Agent.SystemPrompt, Tools: tools, ContextFiles: files, Cwd: workingDir}) + "\n\n<execution_controls>\n" + summary + fmt.Sprintf("\nModel requests per renewable batch: %d. Bash default timeout: %d seconds.\n</execution_controls>", cfg.Agent.MaxTurns, effectiveBashTimeout(cfg.Env.BashTimeout)), nil
+	}
+	system, err := build(context.Background())
+	if err != nil {
+		return nil, err
 	}
 
 	store := session.NewStore(sessionDir)
@@ -146,16 +256,26 @@ func openConversation(cfg config.Config, apiKeyFlag, baseURL string, continueSes
 		return nil, fmt.Errorf("session startup: %w", err)
 	}
 
-	build := func(ctx context.Context) string {
-		return systemPrompt(ctx, cfg.Agent, localEnv, tools, workingDir, stderr)
+	broker := policy.NewBroker()
+	var ask policy.Confirm
+	if confirm != nil {
+		ask = broker.Ask
 	}
+	succeeded = true
 	return app.New(app.Options{
-		Client: client, Config: agent.RunConfig{Model: cfg.Model.Name, MaxTokens: cfg.Model.MaxTokens, MaxTurns: cfg.Agent.MaxTurns},
-		Tools: tools, SystemPrompt: build(context.Background()), Cwd: workingDir, Session: activeSession,
+		Client: client, Config: agent.RunConfig{Model: cfg.Model.Name, MaxTokens: cfg.Model.MaxTokens, MaxTurns: cfg.Agent.MaxTurns, BeforeToolCall: policy.ApprovalGate(controls.Approval, ask, tools...)},
+		Tools: tools, SystemPrompt: system, Cwd: workingDir, Session: activeSession,
 		CreateSession:     func(ctx context.Context) (app.Session, error) { return store.Create(ctx, workingDir) },
 		BuildSystemPrompt: build,
-		Warn:              func(err error) { fmt.Fprintf(stderr, "warning: %v\n", err) },
+		Warn:              warn, Broker: broker, Confirm: confirm, Controls: summary, Cleanup: cleanup,
 	}), nil
+}
+
+func effectiveBashTimeout(seconds int) int {
+	if seconds <= 0 {
+		return builtintools.DefaultBashTimeoutSeconds
+	}
+	return seconds
 }
 
 // systemPrompt loads project context files and renders the system prompt.
@@ -213,11 +333,26 @@ func printPrompt(conversation *app.Conversation, prompt string, stdout, stderr i
 	ctx, stop := interruptContext()
 	defer stop()
 	renderer := eventRenderer{stdout: stdout, stderr: stderr}
-	if err := conversation.Prompt(ctx, prompt, renderer.Render); err != nil {
+	result, err := conversation.Prompt(ctx, prompt, renderer.Render)
+	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
+	if result.Status == agent.EndTurnLimit {
+		printPaused(conversation, stderr)
+		return 2
+	}
 	return 0
+}
+
+func printPaused(conversation *app.Conversation, out io.Writer) {
+	info := conversation.Info()
+	fmt.Fprintln(out, "Paused at the turn checkpoint. Use /continue to grant another batch.")
+	if info.PersistenceEnabled {
+		fmt.Fprintf(out, "Progress saved to %s\nRestart from %s with --continue and the same --session-dir/control flags, then enter /continue.\n", info.Metadata.Path, info.Cwd)
+	} else {
+		fmt.Fprintln(out, "Persistence is disabled: complete progress is in memory only and may be lost on restart.")
+	}
 }
 
 func interruptContext() (context.Context, context.CancelFunc) {

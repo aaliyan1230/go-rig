@@ -21,7 +21,18 @@ func (AgentStart) agentEvent() {}
 type AgentEnd struct {
 	Messages []message.AgentMessage
 	Err      error
+	Reason   EndReason
+	Turns    int
 }
+
+type EndReason string
+
+const (
+	EndCompleted EndReason = "completed"
+	EndTurnLimit EndReason = "turn_limit"
+	EndCanceled  EndReason = "canceled"
+	EndError     EndReason = "error"
+)
 
 func (AgentEnd) agentEvent() {}
 

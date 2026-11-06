@@ -157,8 +157,42 @@ func TestRunStopsAtMaximumTurnsAfterToolBatch(t *testing.T) {
 	if len(client.requests) != 1 {
 		t.Fatalf("expected one provider request, got %d", len(client.requests))
 	}
-	if !errors.Is(agentEnd(t, events).Err, ErrMaxTurns) {
-		t.Fatalf("expected maximum-turn error, got %v", agentEnd(t, events).Err)
+	if end := agentEnd(t, events); end.Err != nil || end.Reason != EndTurnLimit || end.Turns != 1 {
+		t.Fatalf("expected paused outcome, got %+v", end)
+	}
+}
+
+func TestContinueEligibility(t *testing.T) {
+	assistant := assistantWithToolCall("call", "echo", `{"value":"hi"}`)
+	result := message.ToolResultMessage{ToolCallID: "call", ToolName: "echo"}
+	for _, tc := range []struct {
+		name     string
+		messages []message.AgentMessage
+		want     bool
+	}{
+		{"empty", nil, false},
+		{"user", []message.AgentMessage{userPrompt("hi")}, true},
+		{"completed", []message.AgentMessage{assistantWithText("done")}, false},
+		{"unexecuted", []message.AgentMessage{assistant}, false},
+		{"batch", []message.AgentMessage{assistant, result}, true},
+		{"orphan", []message.AgentMessage{result}, false},
+		{"wrong call", []message.AgentMessage{assistant, message.ToolResultMessage{ToolCallID: "other"}}, false},
+		{"duplicate result", []message.AgentMessage{assistant, result, result}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanContinue(tc.messages); got != tc.want {
+				t.Fatalf("got %t want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTurnRenewalCancellationDoesNotRequestAgain(t *testing.T) {
+	client := &scriptedClient{responses: []message.AssistantMessage{assistantWithToolCall("call", "echo", `{"value":"hi"}`), assistantWithText("must not run")}}
+	events := collectEvents(Run(context.Background(), client, []message.AgentMessage{userPrompt("work")}, AgentContext{Tools: []Tool{&echoTool{}}}, RunConfig{Model: "test", MaxTurns: 1, OnTurnLimit: func(context.Context, TurnLimitInfo) (bool, error) { return false, context.Canceled }}))
+	end := agentEnd(t, events)
+	if end.Reason != EndCanceled || !errors.Is(end.Err, context.Canceled) || end.Turns != 1 || len(client.requests) != 1 {
+		t.Fatal(end, len(client.requests))
 	}
 }
 

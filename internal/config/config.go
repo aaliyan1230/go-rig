@@ -31,8 +31,9 @@ type ToolConfig struct {
 }
 
 type EnvConfig struct {
-	WorkingDir string
-	ShellPath  string
+	WorkingDir  string
+	ShellPath   string
+	BashTimeout int
 }
 
 func DefaultConfig() Config {
@@ -43,7 +44,7 @@ func DefaultConfig() Config {
 			MaxTokens: 4096,
 		},
 		Agent: AgentConfig{
-			MaxTurns: 10,
+			MaxTurns: 50,
 		},
 		Tools: ToolConfig{
 			Read:  true,
@@ -52,7 +53,8 @@ func DefaultConfig() Config {
 			Bash:  true,
 		},
 		Env: EnvConfig{
-			ShellPath: "/bin/bash",
+			ShellPath:   "/bin/bash",
+			BashTimeout: 30,
 		},
 	}
 }

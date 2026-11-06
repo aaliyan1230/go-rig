@@ -36,22 +36,32 @@ type bashArgs struct {
 // transcript. Keeping execution behind Env makes this tool testable and leaves
 // room for a future container or remote implementation.
 type BashTool struct {
-	env env.Env
+	env            env.Env
+	defaultTimeout int
 }
 
 var _ agent.Tool = (*BashTool)(nil)
 
 func NewBashTool(environment env.Env) *BashTool {
-	return &BashTool{env: environment}
+	return NewBashToolWithTimeout(environment, DefaultBashTimeoutSeconds)
+}
+
+func NewBashToolWithTimeout(environment env.Env, seconds int) *BashTool {
+	if seconds <= 0 {
+		seconds = DefaultBashTimeoutSeconds
+	}
+	return &BashTool{env: environment, defaultTimeout: seconds}
 }
 
 func (t *BashTool) ToolName() string { return "bash" }
 
 func (t *BashTool) ToolDescription() string {
-	return "Execute a bash command in the current working directory. Returns labeled stdout and stderr, bounded to the last 2,000 lines or 50 KiB. The default timeout is 30 seconds."
+	return fmt.Sprintf("Execute a bash command in the current working directory. Returns labeled stdout and stderr, bounded to the last 2,000 lines or 50 KiB. The default timeout is %d seconds.", t.defaultTimeout)
 }
 
-func (t *BashTool) ToolSchema() json.RawMessage { return bashSchema }
+func (t *BashTool) ToolSchema() json.RawMessage {
+	return json.RawMessage(strings.ReplaceAll(string(bashSchema), "default: 30", fmt.Sprintf("default: %d", t.defaultTimeout)))
+}
 
 func (t *BashTool) Execute(ctx context.Context, _ string, params json.RawMessage) (agent.ToolResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -69,7 +79,7 @@ func (t *BashTool) Execute(ctx context.Context, _ string, params json.RawMessage
 		return agent.ToolResult{}, fmt.Errorf("invalid bash arguments: timeout must be an integer")
 	}
 
-	timeoutSeconds := DefaultBashTimeoutSeconds
+	timeoutSeconds := t.defaultTimeout
 	if args.Timeout != nil {
 		if *args.Timeout <= 0 {
 			return agent.ToolResult{}, fmt.Errorf("invalid bash arguments: timeout must be positive")

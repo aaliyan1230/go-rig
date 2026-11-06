@@ -40,6 +40,8 @@ type ReadTool struct {
 
 var _ agent.Tool = (*ReadTool)(nil)
 
+func (t *ReadTool) ReadOnly() bool { return true }
+
 func NewReadTool(environment env.Env) *ReadTool {
 	return &ReadTool{env: environment}
 }
